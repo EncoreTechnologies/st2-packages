@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 #
-# DO NOT EDIT MANUALLY.  GENERATED FOR ubuntu 22.04
+# DO NOT EDIT MANUALLY.  GENERATED FOR rocky 9
 #
 # Please edit the corresponding template file and include files in https://github.com/StackStorm/st2-packages.git.
 
@@ -234,16 +234,13 @@ setup_username_password()
 pkg_install()
 {
     
-    # Silence debconf prompt, raised during some dep installations. This will be passed to sudo via 'env_keep'.
-    export DEBIAN_FRONTEND=noninteractive
-    
-    sudo apt -y install $@
+    sudo dnf -y install $@
 }
 
 pkg_meta_update()
 {
     
-    sudo apt update -y
+    sudo dnf -y makecache --refresh
     
 }
 
@@ -251,35 +248,52 @@ pkg_is_installed()
 {
     PKG="$1"
     
-    # ii indicates the package is correctly installed.
-    dpkg -l "$PKG" | grep -qE "^ii.*${PKG}"
+    sudo rpm -q "$PKG" | grep -qE "^${PKG}"
     
 }
 ###############[ REPOSITORY MANAGER FUNCTIONS ]###############
 
 
+pkg_get_latest_version()
+{
+    local PKG="$1" # st2
+    local VERSION="$2" # 3.9dev
+    LATEST=$(repoquery -y --nvr --show-duplicates "$PKG" | grep -F "${PKG}-${VERSION}" | sort --version-sort | tail -n 1)
+    echo "${LATEST#*-}"
+}
+
+
+repo_add_gpg_key()
+{
+    KEY_NAME="$1"
+    KEY_URL="$2"
+    rpm --import "${KEY_URL}"
+}
+
 
 repo_definition()
 {
-    REPO_PATH="/etc/apt/sources.list.d"
-    GPG_KEY_PATH="/etc/apt/trusted.gpg.d"
-
     REPO_NAME="$1"
     REPO_URL="$2"
-    REPO_SUITES="$3"
-    REPO_COMPONENT="$4"
-    KEY_NAME="$5"
-    KEY_URL="$6"
+    KEY_NAME="$3"
+    KEY_URL="$4"
+    REPO_PATH="/etc/yum.repos.d"
 
-    repo_add_gpg_key "$KEY_NAME" "$KEY_URL"
-    # DEB822 is preferred over list format.
-    sudo cat <<EOF >"${REPO_PATH}/${REPO_NAME}.sources"
-Types: deb
-URIs: ${REPO_URL}
-Suites: ${REPO_SUITES}
-Components: ${REPO_COMPONENT}
-Architectures: $(dpkg --print-architecture)
-Signed-By: ${GPG_KEY_PATH}/${KEY_NAME}.gpg
+    cat <<EOF >"${REPO_PATH}/${REPO_NAME}.repo"
+[${REPO_NAME}]
+name=${REPO_NAME}
+baseurl=${REPO_URL}
+repo_gpgcheck=1
+enabled=1
+# ${KEY_NAME}
+gpgkey=${KEY_URL}
+gpgcheck=0
+sslverify=1
+sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+metadata_expire=300
+pkg_gpgcheck=1
+autorefresh=1
+type=rpm-md
 EOF
 }
 
@@ -288,13 +302,13 @@ repo_kv_set()
     REPO_NAME="$1"
     KEY="$2"
     VALUE="$3"
-    REPO_PATH="/etc/apt/sources.list.d"
-    REPO_FILENAME="${REPO_PATH}/${REPO_NAME}.sources"
+    REPO_PATH="/etc/yum.repos.d"
+    REPO_FILENAME="${REPO_PATH}/${REPO_NAME}.repo"
     if [[ -f "${REPO_FILENAME}" ]]; then
-        if grep -Eq "^${KEY}:" "$REPO_FILENAME"; then
-            sudo sed -ri "s/^${KEY}:.*/${KEY}: ${VALUE}/g" "$REPO_FILENAME"
+        if grep -Eq "^${KEY}=" "$REPO_FILENAME"; then
+            sudo sed -ri "s/^${KEY}=.*/${KEY}=${VALUE}/g" "$REPO_FILENAME"
         else
-            TMP=$(cat "${REPO_FILENAME}" <(echo "${KEY}: ${VALUE}"))
+            TMP=$(cat "${REPO_FILENAME}" <(echo "${KEY}=${VALUE}"))
             sudo bash -c "cat <<<\"$TMP\" >${REPO_FILENAME}"
         fi
     else
@@ -303,28 +317,11 @@ repo_kv_set()
     fi
 }
 
-repo_add_gpg_key()
-{
-    GPG_KEY_PATH="/etc/apt/trusted.gpg.d"
-    KEY_NAME="$1"
-    KEY_URL="$2"
-
-    curl -1sLf "$KEY_URL" | sudo gpg --dearmor -o "${GPG_KEY_PATH}/${KEY_NAME}.gpg.tmp"
-    sudo mv "${GPG_KEY_PATH}/${KEY_NAME}.gpg.tmp" "${GPG_KEY_PATH}/${KEY_NAME}.gpg"
-}
-
-
-pkg_get_latest_version()
-{
-    local PKG="$1"
-    local VERSION="$2"
-    apt-cache show "$PKG" | awk '/Version:/{print $2}' | grep "^${VERSION//./\\.}" | sort --version-sort | tail -n 1
-}
-
-
 repo_clean_meta()
 {
-    true
+    dnf -y clean metadata
+    dnf -y clean dbcache
+    dnf -y clean all
 }
 
 
@@ -348,19 +345,24 @@ repo_pkg_availability() {
 system_install_runtime_packages()
 {
     
+    # Extra Packages for Enterprise Linux (EPEL) for crudini requirement
+    if ! pkg_is_installed epel-release; then
+        pkg_install https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+    fi
+    
     local PKG_DEPS=(
         crudini
         curl
         jq
         logrotate
         net-tools
-        
-        iproute2
-        gnupg
-        apt-transport-https
-        apache2-utils
-        ca-certificates
-        
+        # Use repoquery tool from yum-utils to get package_name-package_ver-package_rev in RPM based distros
+        # if we don't want to construct this string manually using yum info --show-duplicates and
+        # doing a bunch of sed awk magic. Problem is this is not installed by default on all images.
+        yum-utils
+        iproute
+        gnupg2
+        httpd-tools
         )
     pkg_meta_update
     pkg_install ${PKG_DEPS[@]}
@@ -559,35 +561,28 @@ fail()
 }
 ###############[ STACKSTORM ]###############
 
-
 st2_configure_repository()
 {
     local REPO_TGT="$1"
     repo_definition "st2-${REPO_TGT}" \
-                    "https://packagecloud.io/StackStorm/${REPO_TGT}/${OS_ID}" \
-                    "${OS_VERSION_CODENAME}" \
-                    "main" \
+                    "https://packagecloud.io/StackStorm/${REPO_TGT}/el/9/\$basearch/" \
                     "st2-${REPO_TGT}-key" \
                     "https://packagecloud.io/StackStorm/${REPO_TGT}/gpgkey"
 }
 st2_distribution_name()
 {
-    echo "${OS_VERSION_CODENAME}"
+    echo "el9"
 }
 st2_install_from_url()
 {
     local PACKAGE_URL="$1"
-    local PACKAGE_FILENAME="$(basename ${PACKAGE_URL})"
-    curl -sSL -k -o "${PACKAGE_FILENAME}" "${PACKAGE_URL}"
-    sudo dpkg --install --force-depends "${PACKAGE_FILENAME}"
-    sudo apt install --yes --fix-broken
-    rm "${PACKAGE_FILENAME}"
+    pkg_install "${PACKAGE_URL}"
 }
 st2_install_pkg_version()
 {
     local PKG="$1"
     local VERSION="$2"
-    pkg_install "${PKG}=${VERSION}"
+    pkg_install "${PKG}-${VERSION}"
 }
 
 
@@ -888,42 +883,28 @@ st2web_install()
     st2_install_pkg_version st2web ${ST2WEB_PKG_VERSION}
 }
 ###############[ NODEJS ]###############
-
 nodejs_configure_repository()
 {
     local NODE_VERSION="20.x"
-
-    local RM_FILES=(
-        /etc/apt/preferences.d/nsolid.pref
-        /usr/share/keyrings/nodesource.gpg
-        /etc/apt/sources.list.d/nodesource.list
-        /etc/apt/preferences.d/nodejs.pref
-    )
-    for f in "${RM_FILES[@]}"
-    do
-        rm -f "$i" || true
-    done
+    rm -f /etc/yum.repos.d/nodesource*.repo \
+        "nodejs-${NODE_VERSION}.repo" \
+        "nsolid.repo"
 
     repo_definition "nodejs-${NODE_VERSION}" \
-                    "https://deb.nodesource.com/node_${NODE_VERSION}" \
-                    "nodistro" \
-                    "main" \
+                    "https://rpm.nodesource.com/pub_${NODE_VERSION}/nodistro/nodejs/x86_64" \
                     "nodejs-${NODE_VERSION}-key" \
-                    "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key"
+                    "https://rpm.nodesource.com/gpgkey/ns-operations-public.key"
+    repo_kv_set "nodejs-${NODE_VERSION}" repo_gpgcheck 0
 
-    # N|Solid pinning
-    sudo cat <<EOF >/etc/apt/preferences.d/nsolid.pref
-Package: nsolid
-Pin: origin deb.nodesource.com
-Pin-Priority: 600
-EOF
+    # Add N|Solid repository if Node.js is an LTS version
+    if [[ "$NODE_VERSION" =~ ^(18|20|22)".x" ]]; then
+        repo_definition "nsolid" \
+                        "https://rpm.nodesource.com/pub_${NODE_VERSION}/nodistro/nsolid/x86_64" \
+                        "nsolid-key" \
+                        "https://rpm.nodesource.com/gpgkey/ns-operations-public.key"
+        repo_kv_set "nsolid" repo_gpgcheck 0
+    fi
 
-    # N|Solid pinning
-    sudo cat <<EOF >/etc/apt/preferences.d/nodejs.pref
-Package: nodejs
-Pin: origin deb.nodesource.com
-Pin-Priority: 600
-EOF
 }
 
 
@@ -934,27 +915,36 @@ nodejs_install()
     pkg_install nodejs
 }
 ###############[ NGINX ]###############
-
 nginx_configure_repo()
 {
     repo_definition "nginx" \
-                    "http://nginx.org/packages/${OS_ID}" \
-                    "${OS_VERSION_CODENAME}" \
-                    "nginx" \
+                    "http://nginx.org/packages/rhel/9/x86_64/" \
                     "nginx-key" \
                     "http://nginx.org/keys/nginx_signing.key"
 }
 nginx_update_default_configuration()
 {
-    true
+    sudo cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak
+    # comment out server block eg. server {...}
+    sudo awk '/^    server {/{f=1}f{$0 = "#" $0}{print}' /etc/nginx/nginx.conf.bak >/etc/nginx/nginx.conf
+    sudo sed -i -e 's/##/#/' /etc/nginx/nginx.conf
+    sudo sed -i -e 's/#}/}/' /etc/nginx/nginx.conf
 }
 nginx_update_firewall_rules()
 {
-    true
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        sudo firewall-cmd --zone=public --add-service=http --add-service=https
+        sudo firewall-cmd --zone=public --permanent --add-service=http --add-service=https
+    fi
 }
 nginx_adjust_selinux_policies()
 {
-    true
+    if getenforce | grep -q 'Enforcing'; then
+        # SELINUX management tools, not available for some minimal installations
+        pkg_install policycoreutils-python-utils
+        # Allow network access for nginx
+        sudo setsebool -P httpd_can_network_connect 1
+    fi
 }
 
 nginx_gernerate_certificate()
@@ -997,23 +987,35 @@ nginx_install()
     sudo systemctl restart nginx
 }
 ###############[ MONGODB ]###############
-
-
 mongodb_configure_repo()
 {
     repo_definition "mongodb-org-7.0" \
-                    "https://repo.mongodb.org/apt/${OS_ID}" \
-                    "${OS_VERSION_CODENAME}/mongodb-org/7.0" \
-                    "multiverse" \
+                    "https://repo.mongodb.org/yum/redhat/9/mongodb-org/7.0/x86_64/" \
                     "mongodb-org-7.0-key" \
-                    "https://www.mongodb.org/static/pgp/server-7.0.asc"
+                    "https://pgp.mongodb.com/server-7.0.asc"
+}
+mongodb_adjust_selinux_policies()
+{
+    if getenforce | grep -q 'Enforcing'; then
+        # RHEL9 selinux policy is more restrictive than RHEL8 by default which requires
+        # the installation of a mongodb policy to allow it to run.
+        # Note that depending on distro assembly/settings you may need more rules to change
+        # Apply these changes OR disable selinux in /etc/selinux/config (manually)
+        echo.info "Applying MongoDB SELinux policy."
+        pkg_install git make checkpolicy policycoreutils selinux-policy-devel
+        test -d /root/mongodb-selinux || sudo git clone https://github.com/mongodb/mongodb-selinux /root/mongodb-selinux
+        cd /root/mongodb-selinux && \
+        make && \
+        sudo make install
+    fi
 }
 mongodb_configuration()
 {
-    local MONGODB_USER="mongodb"
-    local DB_PATH="/var/lib/mongodb"
+    local MONGODB_USER="mongod"
+    local DB_PATH="/var/lib/mongo"
     local LOG_PATH="/var/log/mongodb"
     mongodb_write_configuration "$MONGODB_USER" "$DB_PATH" "$LOG_PATH"
+    mongodb_adjust_selinux_policies
 }
 
 
@@ -1095,55 +1097,32 @@ EOF
     sudo systemctl restart mongod
 }
 ###############[ RABBITMQ ]###############
-
 rabbitmq_configure_repo()
 {
-    # https://www.rabbitmq.com/docs/install-debian
-    repo_add_gpg_key "com.rabbitmq.team.gpg" "https://keys.openpgp.org/vks/v1/by-fingerprint/0A9AF2115F4687BD29803A206B73A36E6026DFCA"
-
+    # https://www.rabbitmq.com/docs/install-rpm
     repo_definition "erlang" \
-                    "https://ppa1.rabbitmq.com/rabbitmq/rabbitmq-erlang/deb/${OS_ID}" \
-                    "${OS_VERSION_CODENAME}" \
-                    "main" \
+                    "https://yum1.rabbitmq.com/erlang/el/9/\$basearch" \
                     "erlang-key" \
                     "https://github.com/rabbitmq/signing-keys/releases/download/3.0/cloudsmith.rabbitmq-erlang.E495BB49CC4BBE5B.key"
     repo_definition "rabbitmq-server" \
-                    "https://ppa1.rabbitmq.com/rabbitmq/rabbitmq-server/deb/${OS_ID}" \
-                    "${OS_VERSION_CODENAME}" \
-                    "main" \
+                    "https://yum2.rabbitmq.com/rabbitmq/el/9/\$basearch" \
                     "rabbitmq-server-key" \
-                    "https://github.com/rabbitmq/signing-keys/releases/download/3.0/cloudsmith.rabbitmq-server.9F4587F226208342.key"
+                    "https://github.com/rabbitmq/signing-keys/releases/download/3.0/cloudsmith.rabbitmq-server.9F4587F226208342.key https://github.com/rabbitmq/signing-keys/releases/download/3.0/rabbitmq-release-signing-key.asc"
+    repo_definition "rabbitmq-server-noarch" \
+                    "https://yum2.rabbitmq.com/rabbitmq/el/9/noarch" \
+                    "rabbitmq-server-key" \
+                    "https://github.com/rabbitmq/signing-keys/releases/download/3.0/cloudsmith.rabbitmq-server.9F4587F226208342.key https://github.com/rabbitmq/signing-keys/releases/download/3.0/rabbitmq-release-signing-key.asc"
+
+    rabbitmq_adjust_selinux_policies
+
+
 }
 rabbitmq_install_pkgs()
 {
     local PKGS=(
-        erlang-base
-        erlang-asn1
-        erlang-crypto
-        erlang-eldap
-        erlang-ftp
-        erlang-inets
-        erlang-mnesia
-        erlang-os-mon
-        erlang-parsetools
-        erlang-public-key
-        erlang-runtime-tools
-        erlang-snmp
-        erlang-ssl
-        erlang-syntax-tools
-        erlang-tftp
-        erlang-tools
-        erlang-xmerl
+        erlang
         "$RABBITMQ_PKG"
     )
-    # Pinning
-    cat <<EOF >/etc/apt/preferences.d/erlang.pref
-Package: erlang*
-Pin: origin ppa1.rabbitmq.com
-# Note: priority of 1001 (greater than 1000) allows for downgrading.
-# To make package downgrading impossible, use a value of 999
-Pin-Priority: 1001
-EOF
     pkg_install ${PKGS[@]}
 }
 
@@ -1207,15 +1186,9 @@ redis_install()
         echo.info "Skip Redis: Package is already present on the system."
         return
     fi
-
-    # https://redis.io/docs/latest/operate/oss_and_stack/install/archive/install-redis/install-redis-on-linux/
-    repo_definition "redis" \
-                    "https://packages.redis.io/deb" \
-                    "${OS_VERSION_CODENAME}" \
-                    "main" \
-                    "redis-key" \
-                    "https://packages.redis.io/gpg"
-    local REDIS_SERVICE=redis-server
+# https://redis.io/docs/latest/operate/oss_and_stack/install/archive/install-redis/install-redis-on-linux/#install-on-red-hatrocky
+    # use system provided packages.
+    local REDIS_SERVICE=redis
 
     pkg_meta_update
     pkg_install "$REDIS_PKG"

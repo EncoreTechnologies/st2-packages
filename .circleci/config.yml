@@ -14,10 +14,10 @@ jobs:
     resource_class: large
     docker:
       # The primary container is an instance of the first list image listed. Your build commands run in this container.
-      - image: circleci/python:3.6
+      - image: cimg/python:3.10
     working_directory: ~/st2-packages
     environment:
-      DISTROS: "bionic focal el7 el8"
+      DISTROS: "jammy noble el9 el10"
       BASH_ENV: ~/.buildenv
       # These should be set to an empty string, so that st2cd prep tasks are able to replace these
       # with real gitrevs during releases. Note that they are commented out, so that they do not interfere
@@ -26,10 +26,25 @@ jobs:
       # ST2_GITREV: ""
     steps:
       - checkout
+      - run:
+          name: Install latest Docker Compose V2
+          command: |
+            set -x
+            export CODENAME=$(source /etc/os-release && echo "$VERSION_CODENAME")
+            export DISTRO=$(source /etc/os-release && echo "$ID")
+            export ARCH=$(dpkg --print-architecture)
+            # get gpg key for download.docker
+            curl -fsSL https://download.docker.com/linux/${DISTRO}/gpg | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/download.docker.gpg
+            # set source list
+            sudo tee <<<"deb [arch=${ARCH}] https://download.docker.com/linux/${DISTRO} ${CODENAME} stable" /etc/apt/sources.list.d/download.docker.list
+            # update package list
+            sudo apt update
+            # install docker CLI and Docker Compose v2
+            sudo apt install docker-ce-cli docker-compose-plugin
       - setup_remote_docker:
           reusable: true    # default - false
           exclusive: true   # default - true
-          version: 19.03.14
+          version: docker24
       - run:
           name: Ensure installation scripts are synced with their templates
           command: make .generated-files-check
@@ -38,7 +53,7 @@ jobs:
           command: |
             set -x
             docker --version
-            docker-compose --version
+            docker compose version
       - run:
           name: Initialize packages Build Environment
           command: |
@@ -51,7 +66,7 @@ jobs:
           command: |
             set -x
             # Clean-up running containers
-            .circle/docker-compose2.sh clean
+            .circle/docker-compose.sh clean
             # Remove st2-packages-vol container
             docker rm -v --force st2-packages-vol || true
             # Clean-up any created volumes
@@ -67,25 +82,26 @@ jobs:
             docker cp ~/st2-packages st2-packages-vol:/root
       - run:
           name: Pull dependent Docker Images
-          command: .circle/docker-compose2.sh pull ${DISTRO} || .circle/docker-compose2.sh pull ${DISTRO}
+          command: |
+            .circle/docker-compose.sh pull ${DISTRO} || .circle/docker-compose.sh pull ${DISTRO}
       - run:
           name: Build the ${DISTRO} Packages
           command: |
             # Create necessary directories
             mkdir -p ~/st2-packages/build/${DISTRO}/log/
-            
             # Run the build
-            .circle/docker-compose2.sh build ${DISTRO}
-
+            .circle/docker-compose.sh build ${DISTRO}
             # Once build container finishes we can copy packages directly from it
             docker cp st2-packages-vol:/root/build/. ~/st2-packages/build/${DISTRO}
       - run:
           name: Test the Packages
-          command: .circle/docker-compose2.sh test ${DISTRO}
+          command: |
+            .circle/docker-compose.sh test ${DISTRO}
       - run:
           when: always
           name: Grab the st2 logs
-          command: docker cp st2-packages-vol:/var/log/st2 ~/st2-packages/build/${DISTRO}/log/st2
+          command: |
+            docker cp st2-packages-vol:/var/log/st2 ~/st2-packages/build/${DISTRO}/log/st2
       - store_artifacts:
           path: ~/st2-packages/build
           destination: packages
@@ -103,7 +119,7 @@ jobs:
           command: |
             set -x
             # Clean-up running containers
-            .circle/docker-compose2.sh clean
+            .circle/docker-compose.sh clean
             # Remove st2-packages-vol container
             docker rm -v --force st2-packages-vol || true
             # Clean-up any created volumes
@@ -113,16 +129,17 @@ jobs:
   deploy:
     docker:
       # The primary container is an instance of the first list image listed. Your build commands run in this container.
-      - image: circleci/ruby:2.7
+      - image: cimg/ruby:2.7
     working_directory: /tmp/deploy
     environment:
-      - DISTROS: "bionic focal el7 el8"
+      - DISTROS: "jammy noble el9 el10"
     steps:
       - attach_workspace:
           at: .
       - run:
           name: List workspace files
-          command: find . | sed 's|[^/]*/|  |g'
+          command: |
+            find . | sed 's|[^/]*/|  |g'
       - run:
           name: Install dependencies
           command: |

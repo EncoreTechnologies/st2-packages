@@ -6,39 +6,35 @@
 
 %include ../rpmspec/st2pkg_toptags.spec
 
+# default Python3 version.
+%define pyver 3
+
+# Building st2 v3.10 on rocky9 is forced to py3.11 instead of default py3.9
+%if 0%{?rhel} == 9
+%define pyver 3.11
+%endif
+
 %if 0%{?epoch}
 Epoch: %{epoch}
 %endif
 
-%if 0%{?rhel} == 8
-%global _build_id_links none
+Requires: openssl-devel, libffi-devel, git, pam, openssh-server, openssh-clients, bash, setup
+Requires: python%{pyver}-devel
+
+BuildRequires: python%{pyver}-devel
+BuildRequires: python%{pyver}-setuptools
+%if 0%{?rhel} == 9
+BuildRequires: python%{pyver}
+BuildRequires: python%{pyver}-pip
 %endif
 
-Requires: openssl-devel, libffi-devel, git, pam, openssh-server, openssh-clients, bash, setup
-%if 0%{?rhel} == 8
-Requires: python38-devel
-%else # Requires for RHEL 8
-Requires: python3-devel
-%endif  # Requires for RHEL 7
-
-# EL8 requires a few python packages available within 'BUILDROOT' when outside venv
-# These are in the el8 packagingbuild dockerfile
-# Reference https://fossies.org/linux/ansible/packaging/rpm/ansible.spec
-%if 0%{?rhel} == 8
-# Will use the python3 stdlib venv
-BuildRequires: python38-devel
-BuildRequires: python38-setuptools
-%endif  # Requires for RHEL 7
-
-%if 0%{?rhel} == 8
-# By default on EL 8, RPM helper scripts will try to generate Requires: section which lists every
+# By default the RPM helper scripts will try to generate Requires: section which lists every
 # Python dependencies. That process / script works by recursively scanning all the package Python
 # dependencies which is very slow (5-6 minutes).
 # Our package bundles virtualenv with all the dependendencies and doesn't rely on this metadata
 # so we skip that step to vastly speed up the build.
 # Technically we also don't Require or Provide any of those libraries auto-detected by that script
 # because those are only used internally inside a package specific virtual environment.
-# Same step also does not run on EL7.
 # See https://github.com/StackStorm/st2-packages/pull/697#issuecomment-808971874 and that PR for
 # more details.
 # That issue was found by enabling rpmbuild -vv flag.
@@ -46,7 +42,6 @@ BuildRequires: python38-setuptools
 %undefine __pythondist_requires
 %undefine __python_provides
 %undefine __python_requires
-%endif
 
 Summary: StackStorm all components bundle
 Conflicts: st2common
@@ -58,6 +53,11 @@ Conflicts: st2common
 # Define worker name
 %define worker_name st2actionrunner@
 
+# WORKAROUND: RockyLinux9 doesn't have a python virtualenv rpm so it's installed during build as a dependency with pip.
+%if 0%{?rhel} == 9
+%build
+  pip install virtualenv
+%endif
 
 %install
   %default_install
@@ -67,12 +67,10 @@ Conflicts: st2common
   %service_install st2scheduler
   make post_install DESTDIR=%{buildroot}
 
-# We build cryptography for EL8, and this can contain buildroot path in the
+# We build cryptography for RHEL8/RHEL9, and this can contain buildroot path in the
 # built .so files. We use strip on these libraries so that there are no
 # references to the buildroot in the st2 rpm
-%if 0%{?rhel} == 8
   %cleanup_so_abspath
-%endif
   %cleanup_python_abspath
 
 %prep
@@ -86,7 +84,8 @@ Conflicts: st2common
   %include rpm/preinst_script.spec
 
 %post
-  %service_post st2actionrunner st2api st2stream st2auth st2notifier st2workflowengine
+  %service_post st2api st2stream st2auth
+  %service_post st2actionrunner st2notifier st2workflowengine
   %service_post st2rulesengine st2timersengine st2sensorcontainer st2garbagecollector
   %service_post st2scheduler
   %include rpm/postinst_script.spec
@@ -102,7 +101,7 @@ Conflicts: st2common
   %service_postun st2scheduler
   # Remove st2 logrotate config, since there's no analog of apt-get purge available
   if [ $1 -eq 0 ]; then
-    [ ! -f /etc/logrotate.d/st2 ] || rm /etc/logrotate.d/st2
+    rm -f /etc/logrotate.d/st2
   fi
 
 %files
@@ -124,9 +123,6 @@ Conflicts: st2common
   %attr(775, root, %{packs_group}) /opt/stackstorm/virtualenvs
   %{_unitdir}/st2actionrunner.service
   %{_unitdir}/%{worker_name}.service
-  %{_unitdir}/st2api.service
-  %{_unitdir}/st2stream.service
-  %{_unitdir}/st2auth.service
   %{_unitdir}/st2notifier.service
   %{_unitdir}/st2rulesengine.service
   %{_unitdir}/st2sensorcontainer.service
